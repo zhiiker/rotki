@@ -96,7 +96,9 @@ const placeholder: () => ExchangePayload = () => ({
   apiKey: null,
   apiSecret: null,
   passphrase: null,
-  krakenAccountType: 'starter'
+  krakenAccountType: 'starter',
+  binanceMarkets: null,
+  ftxSubaccount: null
 });
 
 @Component({
@@ -128,6 +130,7 @@ export default class ExchangeSettings extends Vue {
   edit: boolean = false;
   valid: boolean = false;
   pending: boolean = false;
+  binancePairs: string[] = [];
 
   get dialogTitle(): string {
     return this.edit

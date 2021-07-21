@@ -9,7 +9,7 @@ import gevent
 import requests
 from requests.adapters import Response
 from substrateinterface import SubstrateInterface
-from substrateinterface.exceptions import SubstrateRequestException
+from substrateinterface.exceptions import BlockNotFound, SubstrateRequestException
 from typing_extensions import Literal
 from websocket import WebSocketException
 
@@ -297,6 +297,7 @@ class SubstrateManager():
                 ValueError,
                 WebSocketException,
                 gevent.Timeout,
+                BlockNotFound,
         ) as e:
             msg = str(e)
             if isinstance(e, gevent.Timeout):
@@ -433,7 +434,7 @@ class SubstrateManager():
                 type_registry_preset=si_attributes.type_registry_preset,
                 use_remote_preset=True,
             )
-        except (requests.exceptions.RequestException, WebSocketException) as e:
+        except (requests.exceptions.RequestException, WebSocketException, SubstrateRequestException) as e:  # noqa: E501
             message = (
                 f'{self.chain} could not connect to node at endpoint: {endpoint}. '
                 f'Connection error: {str(e)}.'

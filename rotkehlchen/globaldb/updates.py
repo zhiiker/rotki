@@ -66,8 +66,7 @@ def _force_remote(cursor: sqlite3.Cursor, local_asset: Asset, full_insert: str) 
 
     May raise an sqlite3 error if something fails.
     """
-    cursor.executescript('BEGIN TRANSACTION; PRAGMA foreign_keys=off; COMMIT;')
-    # Delete the old entry
+    cursor.executescript('PRAGMA foreign_keys = OFF;')
     if local_asset.asset_type == AssetType.ETHEREUM_TOKEN:
         token = EthereumToken.from_asset(local_asset)
         cursor.execute(
@@ -83,7 +82,7 @@ def _force_remote(cursor: sqlite3.Cursor, local_asset: Asset, full_insert: str) 
         'DELETE FROM assets WHERE identifier=?;',
         (local_asset.identifier,),
     )
-    cursor.executescript('BEGIN TRANSACTION; PRAGMA foreign_keys=on; COMMIT;')
+    cursor.executescript('PRAGMA foreign_keys = ON;')
     # Insert new entry. Since identifiers are the same, no foreign key constrains should break
     executeall(cursor, full_insert)
     AssetResolver().clean_memory_cache(local_asset.identifier.lower())
@@ -355,7 +354,10 @@ class AssetsUpdater():
         """Performs an asset update by downloading new changes from the remote
 
         If `up_to_version` is given then changes up to and including that version are made.
-        If not all possible changes are applied
+        If not all possible changes are applied.
+
+        For success returns None. If there is conflicts a list of conflicting
+        assets identifiers is going to be returned.
 
         May raise:
             - RemoteError if there is a problem querying Github

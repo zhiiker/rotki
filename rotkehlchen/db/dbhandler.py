@@ -7,12 +7,12 @@ import tempfile
 from collections import defaultdict
 from json.decoder import JSONDecodeError
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union, cast
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Type, Union, cast
 
 from pysqlcipher3 import dbapi2 as sqlcipher
 from typing_extensions import Literal
 
-from rotkehlchen.accounting.structures import ActionType, Balance, BalanceType
+from rotkehlchen.accounting.structures import ActionType, BalanceType
 from rotkehlchen.assets.asset import Asset, EthereumToken
 from rotkehlchen.balances.manual import ManuallyTrackedBalance
 from rotkehlchen.chain.bitcoin.hdkey import HDKey
@@ -35,7 +35,6 @@ from rotkehlchen.chain.ethereum.modules.balancer import (
     BALANCER_EVENTS_PREFIX,
     BALANCER_TRADES_PREFIX,
     BalancerEvent,
-    BalancerEventPool,
 )
 from rotkehlchen.chain.ethereum.modules.uniswap import (
     UNISWAP_EVENTS_PREFIX,
@@ -50,7 +49,7 @@ from rotkehlchen.chain.ethereum.structures import (
 )
 from rotkehlchen.chain.ethereum.trades import AMMSwap
 from rotkehlchen.constants.assets import A_USD
-from rotkehlchen.constants.ethereum import YEARN_VAULTS_PREFIX
+from rotkehlchen.constants.ethereum import YEARN_VAULTS_PREFIX, YEARN_VAULTS_V2_PREFIX
 from rotkehlchen.db.eth2 import ETH2_DEPOSITS_PREFIX
 from rotkehlchen.db.loopring import DBLoopring
 from rotkehlchen.db.schema import DB_SCRIPT_CREATE_TABLES
@@ -85,21 +84,19 @@ from rotkehlchen.errors import (
     UnknownAsset,
     UnsupportedAsset,
 )
+from rotkehlchen.exchanges.binance import BINANCE_MARKETS_KEY
 from rotkehlchen.exchanges.data_structures import AssetMovement, MarginPosition, Trade
+from rotkehlchen.exchanges.ftx import FTX_SUBACCOUNT_DB_SETTING
 from rotkehlchen.exchanges.kraken import KrakenAccountType
 from rotkehlchen.exchanges.manager import SUPPORTED_EXCHANGES
 from rotkehlchen.fval import FVal
 from rotkehlchen.globaldb.handler import GlobalDBHandler
-from rotkehlchen.history.deserialization import deserialize_price
 from rotkehlchen.logging import RotkehlchenLogsAdapter
 from rotkehlchen.premium.premium import PremiumCredentials
 from rotkehlchen.serialization.deserialize import (
     deserialize_action_type_from_db,
-    deserialize_asset_amount,
     deserialize_asset_movement_category_from_db,
-    deserialize_fee,
     deserialize_hex_color_code,
-    deserialize_optional,
     deserialize_timestamp,
     deserialize_trade_type_from_db,
 )
@@ -250,6 +247,7 @@ class DBHandler:
             self.set_settings(initial_settings)
         self.update_owned_assets_in_globaldb()
         self.add_globaldb_assetids()
+        self.ensure_data_integrity()
 
     def __del__(self) -> None:
         if hasattr(self, 'conn') and self.conn:
@@ -979,7 +977,7 @@ class DBHandler:
                 address,
                 timestamp,
                 type,
-                pool_address,
+                pool_address_token,
                 lp_amount,
                 usd_value,
                 amount0,
@@ -1009,92 +1007,6 @@ class DBHandler:
         self.conn.commit()
         self.update_last_write()
 
-    def add_balancer_pools(
-            self,
-            pools: Sequence[BalancerEventPool],
-    ) -> None:
-        query = (
-            """
-            INSERT INTO balancer_pools (
-                address,
-                tokens_number,
-                is_token0_unknown,
-                token0_address,
-                token0_symbol,
-                token0_name,
-                token0_decimals,
-                token0_weight,
-                is_token1_unknown,
-                token1_address,
-                token1_symbol,
-                token1_name,
-                token1_decimals,
-                token1_weight,
-                is_token2_unknown,
-                token2_address,
-                token2_symbol,
-                token2_name,
-                token2_decimals,
-                token2_weight,
-                is_token3_unknown,
-                token3_address,
-                token3_symbol,
-                token3_name,
-                token3_decimals,
-                token3_weight,
-                is_token4_unknown,
-                token4_address,
-                token4_symbol,
-                token4_name,
-                token4_decimals,
-                token4_weight,
-                is_token5_unknown,
-                token5_address,
-                token5_symbol,
-                token5_name,
-                token5_decimals,
-                token5_weight,
-                is_token6_unknown,
-                token6_address,
-                token6_symbol,
-                token6_name,
-                token6_decimals,
-                token6_weight,
-                is_token7_unknown,
-                token7_address,
-                token7_symbol,
-                token7_name,
-                token7_decimals,
-                token7_weight
-            )
-            VALUES (
-                ?,?,
-                ?,?,?,?,?,?,
-                ?,?,?,?,?,?,
-                ?,?,?,?,?,?,
-                ?,?,?,?,?,?,
-                ?,?,?,?,?,?,
-                ?,?,?,?,?,?,
-                ?,?,?,?,?,?,
-                ?,?,?,?,?,?
-            )
-            """
-        )
-        cursor = self.conn.cursor()
-        for pool in pools:
-            pool_tuple = pool.to_db_tuple()
-            try:
-                cursor.execute(query, pool_tuple)
-            except sqlcipher.IntegrityError:  # pylint: disable=no-member
-                self.msg_aggregator.add_warning(
-                    f'Tried to add a Balancer pool that already exists in the DB. '
-                    f'Pool data: {pool_tuple}. Skipping pool.',
-                )
-                continue
-
-        self.conn.commit()
-        self.update_last_write()
-
     def get_balancer_events(
             self,
             from_timestamp: Optional[Timestamp] = None,
@@ -1103,26 +1015,7 @@ class DBHandler:
     ) -> List[BalancerEvent]:
         """Returns a list of Balancer events optionally filtered by time and address"""
         cursor = self.conn.cursor()
-        query = (
-            'SELECT '
-            'tx_hash, '
-            'log_index, '
-            'address, '
-            'timestamp, '
-            'type, '
-            'pool_address, '
-            'lp_amount, '
-            'usd_value, '
-            'amount0, '
-            'amount1, '
-            'amount2, '
-            'amount3, '
-            'amount4, '
-            'amount5, '
-            'amount6, '
-            'amount7 '
-            'FROM balancer_events '
-        )
+        query = 'SELECT * FROM balancer_events '
         # Timestamp filters are omitted, done via `form_query_to_filter_timestamps`
         filters = []
         if address is not None:
@@ -1154,90 +1047,6 @@ class DBHandler:
 
         return events
 
-    def get_balancer_pools(
-            self,
-            addresses: Optional[List[ChecksumEthAddress]] = None,
-    ) -> List[BalancerEventPool]:
-        """Returns a list of Balancer pools optionally filtered by addresses"""
-        cursor = self.conn.cursor()
-        query = (
-            'SELECT '
-            'address, '
-            'tokens_number, '
-            'is_token0_unknown, '
-            'token0_address, '
-            'token0_symbol, '
-            'token0_name, '
-            'token0_decimals, '
-            'token0_weight, '
-            'is_token1_unknown, '
-            'token1_address, '
-            'token1_symbol, '
-            'token1_name, '
-            'token1_decimals, '
-            'token1_weight, '
-            'is_token2_unknown, '
-            'token2_address, '
-            'token2_symbol, '
-            'token2_name, '
-            'token2_decimals, '
-            'token2_weight, '
-            'is_token3_unknown, '
-            'token3_address, '
-            'token3_symbol, '
-            'token3_name, '
-            'token3_decimals, '
-            'token3_weight, '
-            'is_token4_unknown, '
-            'token4_address, '
-            'token4_symbol, '
-            'token4_name, '
-            'token4_decimals, '
-            'token4_weight, '
-            'is_token5_unknown, '
-            'token5_address, '
-            'token5_symbol, '
-            'token5_name, '
-            'token5_decimals, '
-            'token5_weight, '
-            'is_token6_unknown, '
-            'token6_address, '
-            'token6_symbol, '
-            'token6_name, '
-            'token6_decimals, '
-            'token6_weight, '
-            'is_token7_unknown, '
-            'token7_address, '
-            'token7_symbol, '
-            'token7_name, '
-            'token7_decimals, '
-            'token7_weight '
-            'FROM balancer_pools '
-        )
-        bindings = []
-        if addresses is not None and len(addresses) != 0:
-            questionmarks = '?' * len(addresses)
-            query += f'WHERE address IN ({",".join(questionmarks)});'
-            bindings.extend(addresses)
-        else:
-            query += ';'
-
-        results = cursor.execute(query, bindings)
-
-        pools = []
-        for pool_tuple in results:
-            try:
-                pool = BalancerEventPool.deserialize_from_db(pool_tuple)
-            except DeserializationError as e:
-                self.msg_aggregator.add_error(
-                    f'Error deserializing Balancer pool from the DB. Skipping pool. '
-                    f'Error was: {str(e)}',
-                )
-                continue
-            pools.append(pool)
-
-        return pools
-
     def delete_balancer_trades_data(self) -> None:
         """Delete all historical Balancer trades data"""
         cursor = self.conn.cursor()
@@ -1254,7 +1063,6 @@ class DBHandler:
         """Delete all historical Balancer events data"""
         cursor = self.conn.cursor()
         cursor.execute('DELETE FROM balancer_events;')
-        cursor.execute('DELETE FROM balancer_pools;')
         cursor.execute(
             f'DELETE FROM used_query_ranges WHERE name LIKE "{BALANCER_EVENTS_PREFIX}%";',
         )
@@ -1286,22 +1094,14 @@ class DBHandler:
                 timestamp,
                 type,
                 pool_address,
-                is_token0_unknown,
-                token0_address,
-                token0_symbol,
-                token0_name,
-                token0_decimals,
-                is_token1_unknown,
-                token1_address,
-                token1_symbol,
-                token1_name,
-                token1_decimals,
+                token0_identifier,
+                token1_identifier,
                 amount0,
                 amount1,
                 usd_price,
                 lp_amount
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """
         )
         cursor = self.conn.cursor()
@@ -1329,30 +1129,7 @@ class DBHandler:
         and address
         """
         cursor = self.conn.cursor()
-        query = (
-            'SELECT '
-            'tx_hash, '
-            'log_index, '
-            'address, '
-            'timestamp, '
-            'type, '
-            'pool_address, '
-            'is_token0_unknown, '
-            'token0_address, '
-            'token0_symbol, '
-            'token0_name, '
-            'token0_decimals, '
-            'is_token1_unknown, '
-            'token1_address, '
-            'token1_symbol, '
-            'token1_name, '
-            'token1_decimals, '
-            'amount0, '
-            'amount1, '
-            'usd_price, '
-            'lp_amount '
-            'FROM uniswap_events '
-        )
+        query = 'SELECT * FROM uniswap_events '
         # Timestamp filters are omitted, done via `form_query_to_filter_timestamps`
         filters = []
         if address is not None:
@@ -1393,7 +1170,8 @@ class DBHandler:
             self.delete_balancer_events_data()
             self.delete_aave_data()
             self.delete_adex_events_data()
-            self.delete_yearn_vaults_data()
+            self.delete_yearn_vaults_data(version=1)
+            self.delete_yearn_vaults_data(version=2)
             self.delete_loopring_data()
             self.delete_eth2_deposits()
             self.delete_eth2_daily_stats()
@@ -1411,7 +1189,9 @@ class DBHandler:
         elif module_name == 'adex':
             self.delete_adex_events_data()
         elif module_name == 'yearn_vaults':
-            self.delete_yearn_vaults_data()
+            self.delete_yearn_vaults_data(version=1)
+        elif module_name == 'yearn_vaults_v2':
+            self.delete_yearn_vaults_data(version=2)
         elif module_name == 'loopring':
             self.delete_loopring_data()
         elif module_name == 'eth2':
@@ -1452,27 +1232,7 @@ class DBHandler:
     ) -> None:
         cursor = self.conn.cursor()
         for e in events:
-            pnl_amount = None
-            pnl_usd_value = None
-            if e.realized_pnl:
-                pnl_amount = str(e.realized_pnl.amount)
-                pnl_usd_value = str(e.realized_pnl.usd_value)
-            event_tuple = (
-                address,
-                e.event_type,
-                e.from_asset.identifier,
-                str(e.from_value.amount),
-                str(e.from_value.usd_value),
-                e.to_asset.identifier,
-                str(e.to_value.amount),
-                str(e.to_value.usd_value),
-                pnl_amount,
-                pnl_usd_value,
-                str(e.block_number),
-                str(e.timestamp),
-                e.tx_hash,
-                e.log_index,
-            )
+            event_tuple = e.serialize_for_db(address)
             try:
                 cursor.execute(
                     'INSERT INTO yearn_vaults_events( '
@@ -1489,8 +1249,9 @@ class DBHandler:
                     'block_number, '
                     'timestamp, '
                     'tx_hash, '
-                    'log_index)'
-                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    'log_index,'
+                    'version)'
+                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                     event_tuple,
                 )
             except sqlcipher.IntegrityError:  # pylint: disable=no-member
@@ -1509,49 +1270,56 @@ class DBHandler:
     ) -> List[YearnVaultEvent]:
         cursor = self.conn.cursor()
         query = cursor.execute(
-            'SELECT '
-            'event_type, '
-            'from_asset, '
-            'from_amount, '
-            'from_usd_value, '
-            'to_asset, '
-            'to_amount, '
-            'to_usd_value, '
-            'pnl_amount, '
-            'pnl_usd_value, '
-            'block_number, '
-            'timestamp, '
-            'tx_hash, '
-            'log_index '
-            'from yearn_vaults_events WHERE address=? AND (from_asset=? OR from_asset=?);',
+            'SELECT * from yearn_vaults_events WHERE address=? '
+            'AND (from_asset=? OR from_asset=?);',
             (address, vault.underlying_token.identifier, vault.token.identifier),
         )
         events = []
         for result in query:
-            realized_pnl = None
-            if result[7] is not None:
-                realized_pnl = Balance(amount=FVal(result[7]), usd_value=FVal(result[8]))
-            events.append(YearnVaultEvent(
-                event_type=result[0],
-                from_asset=Asset(result[1]),
-                from_value=Balance(amount=FVal(result[2]), usd_value=FVal(result[3])),
-                to_asset=Asset(result[4]),
-                to_value=Balance(amount=FVal(result[5]), usd_value=FVal(result[6])),
-                realized_pnl=realized_pnl,
-                block_number=int(result[9]),
-                timestamp=Timestamp(int(result[10])),
-                tx_hash=result[11],
-                log_index=result[12],
-            ))
+            try:
+                events.append(YearnVaultEvent.deserialize_from_db(result))
+            except (DeserializationError, UnknownAsset) as e:
+                msg = f'Failed to read yearn vault event from database due to {str(e)}'
+                self.msg_aggregator.add_warning(msg)
+                log.warning(msg, data=result)
         return events
 
-    def delete_yearn_vaults_data(self) -> None:
-        """Delete all historical aave event data"""
+    def get_yearn_vaults_v2_events(
+        self,
+        address: ChecksumEthAddress,
+        from_block: int,
+        to_block: int,
+    ) -> List[YearnVaultEvent]:
         cursor = self.conn.cursor()
-        cursor.execute('DELETE FROM yearn_vaults_events;')
-        cursor.execute(f'DELETE FROM used_query_ranges WHERE name LIKE "{YEARN_VAULTS_PREFIX}%";')
+        query = cursor.execute(
+            'SELECT * from yearn_vaults_events WHERE address=? AND version=2 '
+            'AND block_number BETWEEN ? AND ?',
+            (address, from_block, to_block),
+        )
+        events = []
+        for result in query:
+            try:
+                events.append(YearnVaultEvent.deserialize_from_db(result))
+            except (DeserializationError, UnknownAsset) as e:
+                msg = f'Failed to read yearn vault event from database due to {str(e)}'
+                self.msg_aggregator.add_warning(msg)
+                log.warning(msg, data=result)
+        return events
+
+    def delete_yearn_vaults_data(self, version: int = 1) -> None:
+        """Delete all historical yearn vault events data"""
+        if version not in (1, 2):
+            log.error(f'Called delete yearn vault data with non valid version {version}')
+            return None
+        prefix = YEARN_VAULTS_PREFIX
+        if version == 2:
+            prefix = YEARN_VAULTS_V2_PREFIX
+        cursor = self.conn.cursor()
+        cursor.execute(f'DELETE FROM yearn_vaults_events WHERE version={version};')
+        cursor.execute(f'DELETE FROM used_query_ranges WHERE name LIKE "{prefix}%";')
         self.conn.commit()
         self.update_last_write()
+        return None
 
     def delete_loopring_data(self) -> None:
         """Delete all loopring related data"""
@@ -1569,6 +1337,7 @@ class DBHandler:
         - {exchange_name}_asset_movements
         - aave_events_{address}
         - yearn_vaults_events_{address}
+        - yearn_vaults_v2_events_{address}
         """
         cursor = self.conn.cursor()
         query = cursor.execute(
@@ -1763,9 +1532,8 @@ class DBHandler:
                 f'{blockchain.value} accounts that do not exist',
             )
 
-        # Also remove all ethereum address details saved in the D
+        # Also remove all ethereum address details saved in the DB
         if blockchain == SupportedBlockchain.ETHEREUM:
-
             for address in accounts:
                 self.delete_data_for_ethereum_address(address)  # type: ignore
 
@@ -1845,32 +1613,6 @@ class DBHandler:
 
         return returned_list
 
-    def get_univ2_lp_tokens_for_address_if_time(
-            self,
-            address: ChecksumEthAddress,
-            current_time: Timestamp,
-    ) -> Optional[List[ChecksumEthAddress]]:
-        """Gets the detected uniswap v2 lp tokens for the given address if the
-        given current time is recent enough.
-
-        If not, or if there is no saved entry, return None
-        """
-        json_ret = self._get_address_details_if_time(address, current_time)
-        if json_ret is None:
-            return None
-        addresses_list = json_ret.get('univ2_lp_tokens', None)
-        if addresses_list is None:
-            return None
-
-        if not isinstance(addresses_list, list):
-            # This should never happen
-            self.msg_aggregator.add_warning(
-                f'Found non-list univ2_lp_tokens {json_ret} in the DB for {address}.',
-            )
-            return None
-
-        return addresses_list  # Should we check everything is an address?
-
     def _get_address_details_json(self, address: ChecksumEthAddress) -> Optional[Dict[str, Any]]:
         cursor = self.conn.cursor()
         query = cursor.execute(
@@ -1904,27 +1646,6 @@ class DBHandler:
         if old_details and 'univ2_lp_tokens' in old_details:
             new_details['univ2_lp_tokens'] = old_details['univ2_lp_tokens']
         new_details['tokens'] = [x.identifier for x in tokens]
-        now = ts_now()
-        cursor = self.conn.cursor()
-        cursor.execute(
-            'INSERT OR REPLACE INTO ethereum_accounts_details '
-            '(account, tokens_list, time) VALUES (?, ?, ?)',
-            (address, json.dumps(new_details), now),
-        )
-        self.conn.commit()
-        self.update_last_write()
-
-    def save_univ2_lp_tokens_for_address(
-            self,
-            address: ChecksumEthAddress,
-            tokens: List[ChecksumEthAddress],
-    ) -> None:
-        """Saves detected univ2 lp tokens for an address"""
-        old_details = self._get_address_details_json(address)
-        new_details = {}
-        if old_details and 'tokens' in old_details:
-            new_details['tokens'] = old_details['tokens']
-        new_details['univ2_lp_tokens'] = tokens
         now = ts_now()
         cursor = self.conn.cursor()
         cursor.execute(
@@ -2186,6 +1907,8 @@ class DBHandler:
             api_secret: ApiSecret,
             passphrase: Optional[str] = None,
             kraken_account_type: Optional[KrakenAccountType] = None,
+            binance_markets: Optional[List[str]] = None,
+            ftx_subaccount_name: Optional[str] = None,
     ) -> None:
         if location not in SUPPORTED_EXCHANGES:
             raise InputError(f'Unsupported exchange {str(location)}')
@@ -2204,6 +1927,13 @@ class DBHandler:
                 'VALUES (?, ?, ?, ?)',
                 (name, location.serialize_for_db(), 'kraken_account_type', kraken_account_type.serialize()),  # noqa: E501
             )
+
+        if location in (Location.BINANCE, Location.BINANCEUS) and binance_markets is not None:
+            self.set_binance_pairs(name, binance_markets, location)
+
+        if location == Location.FTX and ftx_subaccount_name is not None:
+            self.set_ftx_subaccount(name, ftx_subaccount_name)
+
         self.conn.commit()
         self.update_last_write()
 
@@ -2216,6 +1946,8 @@ class DBHandler:
             api_secret: Optional[ApiSecret],
             passphrase: Optional[str],
             kraken_account_type: Optional['KrakenAccountType'],
+            binance_markets: Optional[List[str]],
+            ftx_subaccount_name: Optional[str],
             should_commit: bool = False,
     ) -> None:
         """May raise InputError if something is wrong with editing the DB"""
@@ -2263,6 +1995,22 @@ class DBHandler:
                         kraken_account_type.serialize(),
                     ),
                 )
+            except sqlcipher.DatabaseError as e:  # pylint: disable=no-member
+                self.conn.rollback()
+                raise InputError(f'Could not update DB user_credentials_mappings due to {str(e)}') from e  # noqa: E501
+
+        location_is_binance = location in (Location.BINANCE, Location.BINANCEUS)
+        if location_is_binance and binance_markets is not None:
+            try:
+                exchange_name = new_name if new_name is not None else name
+                self.set_binance_pairs(exchange_name, binance_markets, location)
+            except sqlcipher.DatabaseError as e:  # pylint: disable=no-member
+                self.conn.rollback()
+                raise InputError(f'Could not update DB user_credentials_mappings due to {str(e)}') from e  # noqa: E501
+        if location == Location.FTX and ftx_subaccount_name is not None:
+            try:
+                exchange_name = new_name if new_name is not None else name
+                self.set_ftx_subaccount(exchange_name, ftx_subaccount_name)
             except sqlcipher.DatabaseError as e:  # pylint: disable=no-member
                 self.conn.rollback()
                 raise InputError(f'Could not update DB user_credentials_mappings due to {str(e)}') from e  # noqa: E501
@@ -2338,6 +2086,62 @@ class DBHandler:
 
         return extras
 
+    def set_binance_pairs(self, name: str, pairs: List[str], location: Location) -> None:
+        cursor = self.conn.cursor()
+        data = json.dumps(pairs)
+        cursor.execute(
+            'INSERT OR REPLACE INTO user_credentials_mappings '
+            '(credential_name, credential_location, setting_name, setting_value) '
+            'VALUES (?, ?, ?, ?)',
+            (
+                name,
+                location.serialize_for_db(),
+                BINANCE_MARKETS_KEY,
+                data,
+            ),
+        )
+        self.conn.commit()
+        self.update_last_write()
+
+    def get_binance_pairs(self, name: str, location: Location) -> List[str]:
+        cursor = self.conn.cursor()
+        result = cursor.execute(
+            'SELECT setting_value FROM user_credentials_mappings WHERE '
+            'credential_name=? AND credential_location=? AND setting_name=?',
+            (name, location.serialize_for_db(), BINANCE_MARKETS_KEY),  # noqa: E501
+        )
+        data = result.fetchone()
+        if data and data[0] != '':
+            return json.loads(data[0])
+        return []
+
+    def set_ftx_subaccount(self, ftx_name: str, subaccount_name: str) -> None:
+        """This function may raise sqlcipher.DatabaseError"""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'INSERT OR REPLACE INTO user_credentials_mappings '
+            '(credential_name, credential_location, setting_name, setting_value) '
+            'VALUES (?, ?, ?, ?)',
+            (
+                ftx_name,
+                Location.FTX.serialize_for_db(),  # pylint: disable=no-member
+                FTX_SUBACCOUNT_DB_SETTING,
+                subaccount_name,
+            ),
+        )
+
+    def get_ftx_subaccount(self, ftx_name: str) -> Optional[str]:
+        cursor = self.conn.cursor()
+        result = cursor.execute(
+            'SELECT setting_value FROM user_credentials_mappings WHERE '
+            'credential_name=? AND credential_location=? AND setting_name=?',
+            (ftx_name, Location.FTX.serialize_for_db(), FTX_SUBACCOUNT_DB_SETTING),  # noqa: E501 pylint: disable=no-member
+        )
+        data = result.fetchone()
+        if data and data[0].strip() != '':
+            return data[0]
+        return None
+
     def write_tuples(
             self,
             tuple_type: DBTupleType,
@@ -2360,7 +2164,7 @@ class DBHandler:
             for entry in tuples:
                 try:
                     cursor.execute(query, entry)
-                except sqlcipher.IntegrityError:  # pylint: disable=no-member
+                except sqlcipher.IntegrityError as e:  # pylint: disable=no-member
                     if tuple_type == 'ethereum_transaction':
                         nonce = entry[10]
                         # If it's not an internal transaction with the same hash
@@ -2400,14 +2204,15 @@ class DBHandler:
                         # other and both accounts are being tracked.
                         string_repr = db_tuple_to_str(entry, tuple_type)
                         logger.debug(
-                            f'Did not add "{string_repr}" to the DB since'
-                            f'it already exists.',
+                            f'Did not add "{string_repr}" to the DB due to "{str(e)}".'
+                            f'Either it already exists or some constraint was hit.',
                         )
                         continue
 
                     string_repr = db_tuple_to_str(entry, tuple_type)
                     logger.warning(
-                        f'Did not add "{string_repr}" to the DB. It already exists.',
+                        f'Did not add "{string_repr}" to the DB due to "{str(e)}".'
+                        f'It either already exists or some other constraint was hit.',
                     )
                 except sqlcipher.InterfaceError:  # pylint: disable=no-member
                     log.critical(f'Interface error with tuple: {entry}')
@@ -2469,18 +2274,7 @@ class DBHandler:
         The returned list is ordered from oldest to newest
         """
         cursor = self.conn.cursor()
-        query = (
-            'SELECT id,'
-            '  location,'
-            '  open_time,'
-            '  close_time,'
-            '  profit_loss,'
-            '  pl_currency,'
-            '  fee,'
-            '  fee_currency,'
-            '  link,'
-            '  notes FROM margin_positions '
-        )
+        query = 'SELECT * FROM margin_positions '
         if location is not None:
             query += f'WHERE location="{location.serialize_for_db()}" '
         query, bindings = form_query_to_filter_timestamps(query, 'close_time', from_ts, to_ts)
@@ -2489,21 +2283,7 @@ class DBHandler:
         margin_positions = []
         for result in results:
             try:
-                if result[2] == 0:
-                    open_time = None
-                else:
-                    open_time = deserialize_timestamp(result[2])
-                margin = MarginPosition(
-                    location=Location.deserialize_from_db(result[1]),
-                    open_time=open_time,
-                    close_time=deserialize_timestamp(result[3]),
-                    profit_loss=deserialize_asset_amount(result[4]),
-                    pl_currency=Asset(result[5]),
-                    fee=deserialize_fee(result[6]),
-                    fee_currency=Asset(result[7]),
-                    link=result[8],
-                    notes=result[9],
-                )
+                margin = MarginPosition.deserialize_from_db(result)
             except DeserializationError as e:
                 self.msg_aggregator.add_error(
                     f'Error deserializing margin position from the DB. '
@@ -2566,19 +2346,7 @@ class DBHandler:
         The returned list is ordered from oldest to newest
         """
         cursor = self.conn.cursor()
-        query = (
-            'SELECT id,'
-            '  location,'
-            '  category,'
-            '  time,'
-            '  asset,'
-            '  amount,'
-            '  fee_asset,'
-            '  fee,'
-            '  link,'
-            '  address,'
-            '  transaction_id FROM asset_movements '
-        )
+        query = 'SELECT * FROM asset_movements '
         if location is not None:
             query += f'WHERE location="{location.serialize_for_db()}" '
         query, bindings = form_query_to_filter_timestamps(query, 'time', from_ts, to_ts)
@@ -2587,20 +2355,7 @@ class DBHandler:
         asset_movements = []
         for result in results:
             try:
-                movement = AssetMovement(
-                    location=Location.deserialize_from_db(result[1]),
-                    category=deserialize_asset_movement_category_from_db(result[2]),
-                    timestamp=result[3],
-                    asset=Asset(result[4]),
-                    # TODO: should we also _force_positive here? I guess not since
-                    # we always make sure to save it as positive
-                    amount=deserialize_asset_amount(result[5]),
-                    fee_asset=Asset(result[6]),
-                    fee=deserialize_fee(result[7]),
-                    link=result[8],
-                    address=result[9],
-                    transaction_id=result[10],
-                )
+                movement = AssetMovement.deserialize_from_db(result)
             except DeserializationError as e:
                 self.msg_aggregator.add_error(
                     f'Error deserializing asset movement from the DB. '
@@ -2896,20 +2651,7 @@ class DBHandler:
         The returned list is ordered from oldest to newest
         """
         cursor = self.conn.cursor()
-        query = (
-            'SELECT id,'
-            '  time,'
-            '  location,'
-            '  base_asset,'
-            '  quote_asset,'
-            '  type,'
-            '  amount,'
-            '  rate,'
-            '  fee,'
-            '  fee_currency,'
-            '  link,'
-            '  notes FROM trades '
-        )
+        query = 'SELECT * FROM trades '
         if location is not None:
             query += f'WHERE location="{location.serialize_for_db()}" '
         query, bindings = form_query_to_filter_timestamps(query, 'time', from_ts, to_ts)
@@ -2918,19 +2660,7 @@ class DBHandler:
         trades = []
         for result in results:
             try:
-                trade = Trade(
-                    timestamp=deserialize_timestamp(result[1]),
-                    location=Location.deserialize_from_db(result[2]),
-                    base_asset=Asset(result[3]),
-                    quote_asset=Asset(result[4]),
-                    trade_type=deserialize_trade_type_from_db(result[5]),
-                    amount=deserialize_asset_amount(result[6]),
-                    rate=deserialize_price(result[7]),
-                    fee=deserialize_optional(result[8], deserialize_fee),
-                    fee_currency=deserialize_optional(result[9], Asset),
-                    link=result[10],
-                    notes=result[11],
-                )
+                trade = Trade.deserialize_from_db(result)
             except DeserializationError as e:
                 self.msg_aggregator.add_error(
                     f'Error deserializing trade from the DB. Skipping trade. Error was: {str(e)}',
@@ -2969,22 +2699,14 @@ class DBHandler:
                 to_address,
                 timestamp,
                 location,
-                is_token0_unknown,
-                token0_address,
-                token0_symbol,
-                token0_name,
-                token0_decimals,
-                is_token1_unknown,
-                token1_address,
-                token1_symbol,
-                token1_name,
-                token1_decimals,
+                token0_identifier,
+                token1_identifier,
                 amount0_in,
                 amount1_in,
                 amount0_out,
                 amount1_out
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """
         )
         self.write_tuples(tuple_type='amm_swap', query=query, tuples=swap_tuples)
@@ -3000,31 +2722,7 @@ class DBHandler:
         and address
         """
         cursor = self.conn.cursor()
-        query = (
-            'SELECT '
-            'tx_hash, '
-            'log_index, '
-            'address, '
-            'from_address, '
-            'to_address, '
-            'timestamp, '
-            'location, '
-            'is_token0_unknown, '
-            'token0_address, '
-            'token0_symbol, '
-            'token0_name, '
-            'token0_decimals, '
-            'is_token1_unknown, '
-            'token1_address, '
-            'token1_symbol, '
-            'token1_name, '
-            'token1_decimals, '
-            'amount0_in, '
-            'amount1_in, '
-            'amount0_out, '
-            'amount1_out '
-            'FROM amm_swaps '
-        )
+        query = 'SELECT * FROM amm_swaps '
         # Timestamp filters are omitted, done via `form_query_to_filter_timestamps`
         filters = []
         if location is not None:
@@ -3058,14 +2756,6 @@ class DBHandler:
             swaps.append(swap)
 
         return swaps
-
-    def delete_amm_swap(self, swap_id: str) -> Tuple[bool, str]:
-        cursor = self.conn.cursor()
-        cursor.execute('DELETE FROM amm_swaps WHERE id=?', (swap_id,))
-        if cursor.rowcount == 0:
-            return False, 'Tried to delete non-existing AMM swap'
-        self.conn.commit()
-        return True, ''
 
     def set_rotkehlchen_premium(self, credentials: PremiumCredentials) -> None:
         """Save the rotki premium credentials in the DB"""
@@ -3755,3 +3445,44 @@ class DBHandler:
 
         self.conn.commit()
         self.update_last_write()
+
+    def _ensure_data_integrity(
+            self,
+            table_name: str,
+            klass: Union[Type[Trade], Type[AssetMovement], Type[MarginPosition]],
+    ) -> None:
+        updates: List[Tuple[str, str]] = []
+        cursor = self.conn.cursor()
+        results = cursor.execute(f'SELECT * from {table_name};')
+        for result in results:
+            try:
+                obj = klass.deserialize_from_db(result)
+            except (DeserializationError, UnknownAsset):
+                continue
+
+            db_id = result[0]
+            actual_id = obj.identifier
+            if actual_id != db_id:
+                updates.append((actual_id, db_id))
+
+        if len(updates) != 0:
+            logger.debug(
+                f'Found {len(updates)} identifier discrepancies in the DB '
+                f'for {table_name}. Correcting...',
+            )
+            cursor.executemany(f'UPDATE {table_name} SET id = ? WHERE id =?;', updates)
+
+    def ensure_data_integrity(self) -> None:
+        """Runs some checks for data integrity of the DB that can't be verified by SQLite
+
+        For now it mostly tackles https://github.com/rotki/rotki/issues/3010 ,
+        the problem of identifiers of trades, asset movements and margin positions
+        changing and no longer corresponding to the calculated id.
+        """
+        start_time = ts_now()
+        logger.debug('Starting DB data integrity check')
+        self._ensure_data_integrity('trades', Trade)
+        self._ensure_data_integrity('asset_movements', AssetMovement)
+        self._ensure_data_integrity('margin_positions', MarginPosition)
+        self.conn.commit()
+        logger.debug(f'DB data integrity check finished after {ts_now() - start_time} seconds')

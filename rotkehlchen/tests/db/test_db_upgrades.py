@@ -9,9 +9,8 @@ import pytest
 from pysqlcipher3 import dbapi2 as sqlcipher
 
 from rotkehlchen.accounting.structures import BalanceType
-from rotkehlchen.assets.asset import Asset
+from rotkehlchen.assets.asset import Asset, EthereumToken
 from rotkehlchen.assets.typing import AssetType
-from rotkehlchen.chain.ethereum.typing import CustomEthereumToken
 from rotkehlchen.data_handler import DataHandler
 from rotkehlchen.db.dbhandler import DBHandler
 from rotkehlchen.db.old_create import OLD_DB_SCRIPT_CREATE_TABLES
@@ -31,6 +30,7 @@ from rotkehlchen.db.upgrades.v13_v14 import REMOVED_ASSETS, REMOVED_ETH_TOKENS
 from rotkehlchen.errors import DBUpgradeError
 from rotkehlchen.tests.utils.database import (
     mock_dbhandler_add_globaldb_assetids,
+    mock_dbhandler_ensura_data_integrity,
     mock_dbhandler_update_owned_assets,
 )
 from rotkehlchen.tests.utils.factories import make_ethereum_address
@@ -322,7 +322,7 @@ def test_upgrade_db_1_to_2(data_dir, username):
     ethereum accounts are now checksummed"""
     msg_aggregator = MessagesAggregator()
     data = DataHandler(data_dir, msg_aggregator)
-    with creation_patch, target_patch(1), mock_dbhandler_update_owned_assets(), mock_dbhandler_add_globaldb_assetids():  # noqa: E501
+    with creation_patch, target_patch(1), mock_dbhandler_update_owned_assets(), mock_dbhandler_add_globaldb_assetids(), mock_dbhandler_ensura_data_integrity():  # noqa: E501
         data.unlock(username, '123', create_new=True)
     # Manually input a non checksummed account
     data.db.conn.commit()
@@ -351,14 +351,14 @@ def test_upgrade_db_1_to_2(data_dir, username):
 def test_upgrade_db_2_to_3(user_data_dir):
     """Test upgrading the DB from version 2 to version 3, rename BCHSV to BSV"""
     msg_aggregator = MessagesAggregator()
-    with creation_patch, mock_dbhandler_add_globaldb_assetids():
+    with creation_patch, mock_dbhandler_add_globaldb_assetids(), mock_dbhandler_ensura_data_integrity():  # noqa: E501
         db = _init_db_with_target_version(
             target_version=2,
             user_data_dir=user_data_dir,
             msg_aggregator=msg_aggregator,
         )
 
-    with mock_dbhandler_update_owned_assets(), mock_dbhandler_add_globaldb_assetids():
+    with mock_dbhandler_update_owned_assets(), mock_dbhandler_add_globaldb_assetids(), mock_dbhandler_ensura_data_integrity():  # noqa: E501
         populate_db_and_check_for_asset_renaming(
             db=db,
             user_data_dir=user_data_dir,
@@ -375,7 +375,7 @@ def test_upgrade_db_3_to_4(data_dir, username):
     the eth_rpc_port setting is changed to eth_rpc_endpoint"""
     msg_aggregator = MessagesAggregator()
     data = DataHandler(data_dir, msg_aggregator)
-    with creation_patch, target_patch(3), mock_dbhandler_update_owned_assets(), mock_dbhandler_add_globaldb_assetids():  # noqa: E501
+    with creation_patch, target_patch(3), mock_dbhandler_update_owned_assets(), mock_dbhandler_add_globaldb_assetids(), mock_dbhandler_ensura_data_integrity():  # noqa: E501
         data.unlock(username, '123', create_new=True)
     # Manually set version and input the old rpcport setting
     cursor = data.db.conn.cursor()
@@ -390,7 +390,7 @@ def test_upgrade_db_3_to_4(data_dir, username):
     data.db.conn.commit()
 
     # now relogin and check that the setting has been changed and the version bumped
-    with mock_dbhandler_update_owned_assets(), mock_dbhandler_add_globaldb_assetids():
+    with mock_dbhandler_update_owned_assets(), mock_dbhandler_add_globaldb_assetids(), mock_dbhandler_ensura_data_integrity():  # noqa: E501
         del data
         data = DataHandler(data_dir, msg_aggregator)
         with target_patch(target_version=4):
@@ -412,14 +412,14 @@ def test_upgrade_db_3_to_4(data_dir, username):
 def test_upgrade_db_4_to_5(user_data_dir):
     """Test upgrading the DB from version 4 to version 5, rename BCC to BCH"""
     msg_aggregator = MessagesAggregator()
-    with creation_patch, mock_dbhandler_add_globaldb_assetids():
+    with creation_patch, mock_dbhandler_add_globaldb_assetids(), mock_dbhandler_ensura_data_integrity():  # noqa: E501
         db = _init_db_with_target_version(
             target_version=4,
             user_data_dir=user_data_dir,
             msg_aggregator=msg_aggregator,
         )
 
-    with mock_dbhandler_update_owned_assets(), mock_dbhandler_add_globaldb_assetids():
+    with mock_dbhandler_update_owned_assets(), mock_dbhandler_add_globaldb_assetids(), mock_dbhandler_ensura_data_integrity():  # noqa: E501
         populate_db_and_check_for_asset_renaming(
             db=db,
             user_data_dir=user_data_dir,
@@ -852,11 +852,12 @@ def test_upgrade_db_11_to_12(user_data_dir):
     Deleting all bittrex data from the DB"""
     msg_aggregator = MessagesAggregator()
     _use_prepared_db(user_data_dir, 'v11_rotkehlchen.db')
-    db = _init_db_with_target_version(
-        target_version=12,
-        user_data_dir=user_data_dir,
-        msg_aggregator=msg_aggregator,
-    )
+    with mock_dbhandler_ensura_data_integrity():
+        db = _init_db_with_target_version(
+            target_version=12,
+            user_data_dir=user_data_dir,
+            msg_aggregator=msg_aggregator,
+        )
 
     # Make sure that only one trade is left
     cursor = db.conn.cursor()
@@ -887,7 +888,6 @@ def test_upgrade_db_12_to_13(user_data_dir):
 
     # Make sure that current balances table is deleted
     cursor = db.conn.cursor()
-    # with pytest.raises(sqlcipher.IntegrityError):  # pylint: disable=no-member
     query = cursor.execute(
         'SELECT COUNT(*) FROM sqlite_master WHERE type="table" and name="current_balances"',
     )
@@ -1449,12 +1449,12 @@ def test_upgrade_db_24_to_25(user_data_dir):  # pylint: disable=unused-argument
     """
     msg_aggregator = MessagesAggregator()
     _use_prepared_db(user_data_dir, 'v24_rotkehlchen.db')
-    db_v24 = _init_db_with_target_version(
-        target_version=24,
-        user_data_dir=user_data_dir,
-        msg_aggregator=msg_aggregator,
-
-    )
+    with mock_dbhandler_ensura_data_integrity():
+        db_v24 = _init_db_with_target_version(
+            target_version=24,
+            user_data_dir=user_data_dir,
+            msg_aggregator=msg_aggregator,
+        )
     # copy some test icons in the test directory
     icons_dir = user_data_dir.parent / 'icons'
     custom_icons_dir = icons_dir / 'custom'
@@ -1781,14 +1781,15 @@ def test_upgrade_db_24_to_25(user_data_dir):  # pylint: disable=unused-argument
 def test_upgrade_db_25_to_26(globaldb, user_data_dir, have_kraken, have_kraken_setting):  # pylint: disable=unused-argument  # noqa: E501
     """Test upgrading the DB from version 25 to version 26"""
     msg_aggregator = MessagesAggregator()
-    v25_conn = _init_prepared_db(user_data_dir, 'v25_rotkehlchen.db')
+    with mock_dbhandler_ensura_data_integrity():
+        v25_conn = _init_prepared_db(user_data_dir, 'v25_rotkehlchen.db')
     cursor = v25_conn.cursor()
 
     # make sure the globaldb has a custom token used in the DB
     globaldb.add_asset(
         asset_id='_ceth_0x48Fb253446873234F2fEBbF9BdeAA72d9d387f94',
         asset_type=AssetType.ETHEREUM_TOKEN,
-        data=CustomEthereumToken(
+        data=EthereumToken.initialize(
             address=ChecksumEthAddress('0x48Fb253446873234F2fEBbF9BdeAA72d9d387f94'),
             decimals=18,
             name='foo',
@@ -1921,11 +1922,12 @@ def test_upgrade_db_25_to_26(globaldb, user_data_dir, have_kraken, have_kraken_s
     v25_conn.close()
 
     # Migrate to v26
-    db = _init_db_with_target_version(
-        target_version=26,
-        user_data_dir=user_data_dir,
-        msg_aggregator=msg_aggregator,
-    )
+    with mock_dbhandler_ensura_data_integrity():
+        db = _init_db_with_target_version(
+            target_version=26,
+            user_data_dir=user_data_dir,
+            msg_aggregator=msg_aggregator,
+        )
     cursor = db.conn.cursor()
 
     # Make sure that the user credentials have been upgraded
@@ -2101,6 +2103,94 @@ def test_upgrade_db_25_to_26(globaldb, user_data_dir, have_kraken, have_kraken_s
 
     # Finally also make sure that we have updated to the target version
     assert db.get_version() == 26
+
+
+@pytest.mark.parametrize('use_clean_caching_directory', [True])
+def test_upgrade_db_26_to_27(user_data_dir):  # pylint: disable=unused-argument
+    """Test upgrading the DB from version 26 to version 27.
+
+    - Recreates balancer events, uniswap events, amm_swaps. Deletes balancer pools
+    """
+    msg_aggregator = MessagesAggregator()
+    _use_prepared_db(user_data_dir, 'v26_rotkehlchen.db')
+    db_v26 = _init_db_with_target_version(
+        target_version=26,
+        user_data_dir=user_data_dir,
+        msg_aggregator=msg_aggregator,
+    )
+    # Checks before migration
+    cursor = db_v26.conn.cursor()
+    assert cursor.execute(
+        'SELECT COUNT(*) from used_query_ranges WHERE name LIKE "uniswap%";',
+    ).fetchone()[0] == 2
+    assert cursor.execute(
+        'SELECT COUNT(*) from used_query_ranges WHERE name LIKE "balancer%";',
+    ).fetchone()[0] == 2
+    assert cursor.execute('SELECT COUNT(*) from used_query_ranges;').fetchone()[0] == 6
+    assert cursor.execute('SELECT COUNT(*) from amm_swaps;').fetchone()[0] == 2
+    assert cursor.execute('SELECT COUNT(*) from balancer_pools;').fetchone()[0] == 1
+    assert cursor.execute('SELECT COUNT(*) from balancer_events;').fetchone()[0] == 1
+
+    # Migrate to v27
+    db = _init_db_with_target_version(
+        target_version=27,
+        user_data_dir=user_data_dir,
+        msg_aggregator=msg_aggregator,
+    )
+    cursor = db.conn.cursor()
+    assert cursor.execute('SELECT COUNT(*) from used_query_ranges;').fetchone()[0] == 2
+    assert cursor.execute('SELECT COUNT(*) from amm_swaps;').fetchone()[0] == 0
+    assert cursor.execute('SELECT COUNT(*) from balancer_events;').fetchone()[0] == 0
+
+    # Finally also make sure that we have updated to the target version
+    assert db.get_version() == 27
+
+
+@pytest.mark.parametrize('use_clean_caching_directory', [True])
+def test_upgrade_db_27_to_28(user_data_dir):  # pylint: disable=unused-argument
+    """Test upgrading the DB from version 27 to version 28.
+
+    - Adds a new column 'version' to the 'yearn_vaults_events' table
+    - Delete aave events
+    """
+    msg_aggregator = MessagesAggregator()
+    _use_prepared_db(user_data_dir, 'v27_rotkehlchen.db')
+    db_v27 = _init_db_with_target_version(
+        target_version=27,
+        user_data_dir=user_data_dir,
+        msg_aggregator=msg_aggregator,
+    )
+    cursor = db_v27.conn.cursor()
+
+    # Checks before migration
+    assert cursor.execute('SELECT COUNT(*) FROM aave_events;').fetchone()[0] == 1
+    assert cursor.execute('SELECT COUNT(*) from yearn_vaults_events;').fetchone()[0] == 1
+    # Migrate to v28
+    db = _init_db_with_target_version(
+        target_version=28,
+        user_data_dir=user_data_dir,
+        msg_aggregator=msg_aggregator,
+    )
+    cursor = db.conn.cursor()
+
+    cursor.execute(
+        'SELECT COUNT(*) FROM pragma_table_info("yearn_vaults_events") '
+        'WHERE name="version"',
+    )
+    assert cursor.fetchone()[0] == 1
+
+    cursor.execute('SELECT count(*) from yearn_vaults_events;')
+    assert cursor.fetchone()[0] == 1
+
+    # Check that the version is correct for the event in db
+    cursor.execute('SELECT version from yearn_vaults_events;')
+    assert cursor.fetchone()[0] == 1
+
+    # Check that aave_events got deleted
+    assert cursor.execute('SELECT COUNT(*) FROM aave_events;').fetchone()[0] == 0
+
+    # Finally also make sure that we have updated to the target version
+    assert db.get_version() == 28
 
 
 def test_db_newer_than_software_raises_error(data_dir, username):

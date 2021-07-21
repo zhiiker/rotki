@@ -764,7 +764,7 @@ def test_deleting_ens_account_works(rotkehlchen_api_server, ethereum_accounts):
 
 
 @pytest.mark.parametrize('method', ['PUT', 'DELETE'])
-def test_blockchain_accounts_endpoint_errors(rotkehlchen_api_server, api_port, method):
+def test_blockchain_accounts_endpoint_errors(rotkehlchen_api_server, rest_api_port, method):
     """
     Test /api/(version)/blockchains/(name) for edge cases and errors.
 
@@ -789,7 +789,7 @@ def test_blockchain_accounts_endpoint_errors(rotkehlchen_api_server, api_port, m
     # Provide no blockchain name
     response = requests.request(
         method,
-        f'http://localhost:{api_port}/api/1/blockchains',
+        f'http://localhost:{rest_api_port}/api/1/blockchains',
         json=data,
     )
     assert_error_response(
@@ -1414,6 +1414,9 @@ def _remove_blockchain_accounts_test_start(
     token_balances = {A_RDN: ['0', '0', '450000000', '0']}
     eth_balances_after_removal = ['2000000', '4000000']
     token_balances_after_removal = {}
+    starting_liabilities = {A_DAI: ['5555555', '1000000', '0', '99999999']}
+    after_liabilities = {A_DAI: ['1000000', '99999999']}
+
     if query_balances_before_first_modification:
         # Also test by having balances queried before removing an account
         setup = setup_balances(
@@ -1422,6 +1425,7 @@ def _remove_blockchain_accounts_test_start(
             btc_accounts=btc_accounts,
             eth_balances=all_eth_balances,
             token_balances=token_balances,
+            liabilities=starting_liabilities,
         )
         with ExitStack() as stack:
             setup.enter_blockchain_patches(stack)
@@ -1435,6 +1439,7 @@ def _remove_blockchain_accounts_test_start(
         btc_accounts=btc_accounts,
         eth_balances=all_eth_balances,
         token_balances=token_balances,
+        liabilities=starting_liabilities,
     )
 
     # The application has started with 4 ethereum accounts. Remove two and see that balances match
@@ -1458,6 +1463,7 @@ def _remove_blockchain_accounts_test_start(
         eth_balances=eth_balances_after_removal,
         token_balances=token_balances_after_removal,
         also_btc=query_balances_before_first_modification,
+        expected_liabilities=after_liabilities,
     )
     # Also make sure they are removed from the DB
     accounts = rotki.data.db.get_blockchain_accounts()
@@ -1481,6 +1487,7 @@ def _remove_blockchain_accounts_test_start(
         eth_balances=eth_balances_after_removal,
         token_balances=token_balances_after_removal,
         also_btc=True,
+        expected_liabilities=after_liabilities,
     )
 
     return eth_accounts_after_removal, eth_balances_after_removal, token_balances_after_removal

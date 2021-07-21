@@ -17,6 +17,7 @@ from web3._utils.abi import get_abi_output_types
 from web3._utils.contracts import find_matching_event_abi
 from web3._utils.filters import construct_event_filter_params
 from web3.datastructures import MutableAttributeDict
+from web3.exceptions import BadFunctionCallOutput
 from web3.middleware.exception_retry_request import http_retry_request_middleware
 from web3.types import FilterParams
 
@@ -129,8 +130,10 @@ def _query_web3_get_logs(
             msg = decoded_error.get('message', '')
             # errors from: https://infura.io/docs/ethereum/json-rpc/eth-getLogs
             if msg in ('query returned more than 10000 results', 'query timeout exceeded'):
+                block_range = block_range // 2
+                if block_range < 50:
+                    raise  # stop retrying if block range gets too small
                 # repeat the query with smaller block range
-                block_range = int(block_range / 2)
                 continue
             # else, well we tried .. reraise the Value error
             raise e
@@ -782,7 +785,7 @@ class EthereumManager():
         try:
             method = getattr(contract.caller, method_name)
             result = method(*arguments if arguments else [])
-        except ValueError as e:
+        except (ValueError, BadFunctionCallOutput) as e:
             raise BlockchainQueryError(
                 f'Error doing call on contract {contract_address}: {str(e)}',
             ) from e
@@ -855,14 +858,30 @@ class EthereumManager():
             until_block = (
                 self.etherscan.get_latest_block_number() if to_block == 'latest' else to_block
             )
+            blocks_step = 300000
             while start_block <= until_block:
-                end_block = min(start_block + 300000, until_block)
-                new_events = self.etherscan.get_logs(
-                    contract_address=contract_address,
-                    topics=filter_args['topics'],  # type: ignore
-                    from_block=start_block,
-                    to_block=end_block,
-                )
+                while True:  # loop to continuously reduce block range if need b
+                    end_block = min(start_block + blocks_step, until_block)
+                    try:
+                        new_events = self.etherscan.get_logs(
+                            contract_address=contract_address,
+                            topics=filter_args['topics'],  # type: ignore
+                            from_block=start_block,
+                            to_block=end_block,
+                        )
+                    except RemoteError as e:
+                        if 'Please select a smaller result dataset' in str(e):
+
+                            blocks_step = blocks_step // 2
+                            if blocks_step < 100:
+                                raise  # stop trying
+                            # else try with the smaller step
+                            continue
+
+                        # else some other error
+                        raise
+
+                    break  # we must have a result
 
                 # Turn all Hex ints to ints
                 for e_idx, event in enumerate(new_events):

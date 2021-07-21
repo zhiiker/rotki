@@ -1,4 +1,5 @@
 import subprocess
+import sys
 from http import HTTPStatus
 
 import gevent
@@ -17,11 +18,13 @@ def test_backend():
         stderr=subprocess.STDOUT,
     )
     timeout = 10
+    if sys.platform == 'darwin':
+        timeout = 30  # in macos the backend may take a long time to start
     with gevent.Timeout(timeout):
         try:
             while True:
                 output = proc.stdout.readline().decode('utf-8')
-                if 'rotki API server is running at' in output:
+                if 'rotki REST API server is running at' in output:
                     break
 
             url = f'http://{output.split()[-1]}/api/1/info'

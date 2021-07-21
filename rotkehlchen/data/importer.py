@@ -1,13 +1,15 @@
-from collections import defaultdict
 import csv
 import functools
 import logging
+from collections import defaultdict
 from itertools import count
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-from rotkehlchen.assets.utils import symbol_to_asset_or_token
+from pysqlcipher3 import dbapi2 as sqlcipher
+
 from rotkehlchen.accounting.ledger_actions import LedgerAction, LedgerActionType
+from rotkehlchen.assets.utils import symbol_to_asset_or_token
 from rotkehlchen.constants.assets import A_USD
 from rotkehlchen.constants.misc import ZERO
 from rotkehlchen.db.dbhandler import DBHandler
@@ -22,7 +24,7 @@ from rotkehlchen.serialization.deserialize import (
     deserialize_fee,
     deserialize_timestamp_from_date,
 )
-from rotkehlchen.typing import AssetAmount, Fee, Location, Price, TradeType, Timestamp
+from rotkehlchen.typing import AssetAmount, Fee, Location, Price, Timestamp, TradeType
 
 log = logging.getLogger(__name__)
 
@@ -211,6 +213,7 @@ class DataImporter():
             - UnsupportedCryptocomEntry if importing of this entry is not supported.
             - KeyError if the an expected CSV key is missing
             - UnknownAsset if one of the assets founds in the entry are not supported
+            - sqlcipher.IntegrityError from db_ledger.add_ledger_action
         """
         row_type = csv_row['Transaction Kind']
         timestamp = deserialize_timestamp_from_date(
@@ -394,6 +397,7 @@ class DataImporter():
         May raise:
         - UnknownAsset if an unknown asset is encountered in the imported files
         - KeyError if a row contains unexpected data entries
+        - sqlcipher.IntegrityError from db_ledger.add_ledger_action
         """
         multiple_rows: Dict[Any, Dict[str, Any]] = {}
         investments_deposits: Dict[str, List[Any]] = defaultdict(list)
@@ -580,6 +584,13 @@ class DataImporter():
                 return False, f'Crypto.com csv missing entry for {str(e)}'
             except UnknownAsset as e:
                 return False, f'Encountered unknown asset {str(e)} at crypto.com csv import'
+            except sqlcipher.IntegrityError:  # pylint: disable=no-member
+                self.db.conn.rollback()
+                self.db.msg_aggregator.add_warning(
+                    'Error during cryptocom CSV import consumption. '
+                    ' Entry already existed in DB. Ignoring.',
+                )
+                # continue, since they already are in DB
 
             for row in data:
                 try:
@@ -596,6 +607,14 @@ class DataImporter():
                         f'Error was {str(e)}. Ignoring entry',
                     )
                     continue
+                except sqlcipher.IntegrityError:  # pylint: disable=no-member
+                    self.db.conn.rollback()
+                    self.db.msg_aggregator.add_warning(
+                        'Error during cryptocom CSV import consumption. '
+                        ' Entry already existed in DB. Ignoring.',
+                    )
+                    log.warning(f'cryptocom csv entry {row} aleady existed in DB')
+                    continue
                 except UnsupportedCSVEntry as e:
                     self.db.msg_aggregator.add_warning(str(e))
                     continue
@@ -611,6 +630,7 @@ class DataImporter():
         - UnsupportedBlockFiEntry
         - UnknownAsset
         - DeserializationError
+        - sqlcipher.IntegrityError from db_ledger.add_ledger_action
         """
         if len(csv_row['Confirmed At']) != 0:
             timestamp = deserialize_timestamp_from_date(
@@ -712,6 +732,14 @@ class DataImporter():
                         f'{str(e)}. Ignoring entry',
                     )
                     continue
+                except sqlcipher.IntegrityError:  # pylint: disable=no-member
+                    self.db.conn.rollback()
+                    self.db.msg_aggregator.add_warning(
+                        'Error during blockfi CSV import consumption. '
+                        ' Entry already existed in DB. Ignoring.',
+                    )
+                    log.warning(f'blocki csv entry {row} aleady existed in DB')
+                    continue
                 except UnsupportedCSVEntry as e:
                     self.db.msg_aggregator.add_warning(str(e))
                     continue
@@ -788,10 +816,13 @@ class DataImporter():
         - UnsupportedNexoEntry
         - UnknownAsset
         - DeserializationError
+        - sqlcipher.IntegrityError from db_ledger.add_ledger_action
         """
-        if 'rejected' not in csv_row['Description']:
+        ignored_entries = ('ExchangeToWithdraw', 'DepositToExchange')
+
+        if 'rejected' not in csv_row['Details']:
             timestamp = deserialize_timestamp_from_date(
-                date=csv_row['DateTime'],
+                date=csv_row['Date / Time'],
                 formatstr='%Y-%m-%d %H:%M:%S',
                 location='NEXO',
             )
@@ -802,8 +833,9 @@ class DataImporter():
         asset = symbol_to_asset_or_token(csv_row['Currency'])
         amount = deserialize_asset_amount_force_positive(csv_row['Amount'])
         entry_type = csv_row['Type']
+        transaction = csv_row['Transaction']
 
-        if entry_type in ('Deposit', 'ExchangeDepositedOn'):
+        if entry_type in ('Deposit', 'ExchangeDepositedOn', 'LockingTermDeposit'):
             asset_movement = AssetMovement(
                 location=Location.NEXO,
                 category=AssetMovementCategory.DEPOSIT,
@@ -814,7 +846,7 @@ class DataImporter():
                 amount=amount,
                 fee=Fee(ZERO),
                 fee_asset=A_USD,
-                link='',
+                link=transaction,
             )
             self.db.add_asset_movements([asset_movement])
         elif entry_type in ('Withdrawal', 'WithdrawExchanged'):
@@ -828,7 +860,7 @@ class DataImporter():
                 amount=amount,
                 fee=Fee(ZERO),
                 fee_asset=A_USD,
-                link='',
+                link=transaction,
             )
             self.db.add_asset_movements([asset_movement])
         elif entry_type == 'Withdrawal Fee':
@@ -845,7 +877,7 @@ class DataImporter():
                 notes=f'{entry_type} from Nexo',
             )
             self.db_ledger.add_ledger_action(action)
-        elif entry_type in ('Interest', 'Bonus'):
+        elif entry_type in ('Interest', 'Bonus', 'Dividend'):
             action = LedgerAction(
                 identifier=0,  # whatever is not used at insertion
                 timestamp=timestamp,
@@ -855,10 +887,12 @@ class DataImporter():
                 asset=asset,
                 rate=None,
                 rate_asset=None,
-                link=None,
+                link=transaction,
                 notes=f'{entry_type} from Nexo',
             )
             self.db_ledger.add_ledger_action(action)
+        elif entry_type in ignored_entries:
+            pass
         else:
             raise UnsupportedCSVEntry(f'Unsuported entry {entry_type}. Data: {csv_row}')
 
@@ -883,6 +917,14 @@ class DataImporter():
                         f'Deserialization error during Nexo CSV import. '
                         f'{str(e)}. Ignoring entry',
                     )
+                    continue
+                except sqlcipher.IntegrityError:  # pylint: disable=no-member
+                    self.db.conn.rollback()
+                    self.db.msg_aggregator.add_warning(
+                        'Error during nexro CSV import consumption. '
+                        ' Entry already existed in DB. Ignoring.',
+                    )
+                    log.warning(f'nexo csv entry {row} aleady existed in DB')
                     continue
                 except UnsupportedCSVEntry as e:
                     self.db.msg_aggregator.add_warning(str(e))

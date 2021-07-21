@@ -6,8 +6,7 @@ from urllib.parse import urlencode
 import pytest
 import requests
 
-from rotkehlchen.assets.asset import Asset
-from rotkehlchen.constants.assets import A_BTC, A_ETH
+from rotkehlchen.constants.assets import A_BTC, A_ETH, A_EUR
 from rotkehlchen.exchanges.bitfinex import API_KEY_ERROR_MESSAGE as BITFINEX_API_KEY_ERROR_MESSAGE
 from rotkehlchen.exchanges.bitstamp import (
     API_KEY_ERROR_CODE_ACTION as BITSTAMP_API_KEY_ERROR_CODE_ACTION,
@@ -28,7 +27,6 @@ from rotkehlchen.tests.utils.api import (
     wait_for_async_task,
     wait_for_async_task_with_result,
 )
-from rotkehlchen.tests.utils.constants import A_EUR
 from rotkehlchen.tests.utils.exchanges import (
     assert_binance_balances_result,
     assert_poloniex_balances_result,
@@ -107,7 +105,8 @@ def test_setup_exchange(rotkehlchen_api_server):
                 BITSTAMP_API_KEY_ERROR_CODE_ACTION['API0011'],
                 BITFINEX_API_KEY_ERROR_MESSAGE,
                 KUCOIN_API_KEY_ERROR_CODE[400003],
-                'Bad combination of API Keys',
+                'Error validating API Keys',
+                'ApiKey has invalid value',
             ],
             status_code=HTTPStatus.CONFLICT,
         )
@@ -805,7 +804,7 @@ def test_delete_external_exchange_data_works(rotkehlchen_api_server_with_exchang
         amount=FVal(1),
         rate=FVal(1),
         fee=FVal(1),
-        fee_currency=Asset('EUR'),
+        fee_currency=A_EUR,
         link='',
         notes='',
     ) for x in (Location.CRYPTOCOM, Location.KRAKEN)]
@@ -1015,3 +1014,18 @@ def test_edit_exchange_credentials(rotkehlchen_api_server_with_exchanges):
             # all of the api keys end up in session headers. Check they are properly
             # updated there
             assert any(new_key in value for _, value in exchange.session.headers.items())
+
+
+@pytest.mark.parametrize('added_exchanges', [(Location.BINANCE,)])
+def test_binance_query_pairs(rotkehlchen_api_server_with_exchanges):
+    """Test that the binance endpoint returns some market pairs"""
+    server = rotkehlchen_api_server_with_exchanges
+    response = requests.get(
+        api_url_for(
+            server,
+            'binanceavailablemarkets',
+        ),
+    )
+    result = assert_proper_response_with_result(response)
+    some_pairs = {'ETHUSDC', 'BTCUSDC', 'BNBBTC', 'FTTBNB'}
+    assert some_pairs.issubset(result)
